@@ -6,7 +6,10 @@ import open3d as o3d
 import struct
 import os
 import argparse, os
-
+import sqlite3
+import csv 
+from tabulate import tabulate
+from tqdm import tqdm
 
 def is_rosbag_ros1_or_ros2(bag_file_path):
     """
@@ -196,6 +199,56 @@ class ros2bag():
                 count += 1
 
         print(f"\n🎉 Done! Exported {count} LiDAR frames.")
+    
+    def export_odometry_from_ros2bag(self, output_csv_path):
+        bag_path = Path(self.path)
+        output_csv_path = Path(output_csv_path)
+        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with AnyReader([bag_path]) as reader:
+            # Filter Odometry topics
+            odom_conns = [
+                c for c in reader.connections
+                if c.msgtype == 'nav_msgs/msg/Odometry'
+            ]
+
+            if not odom_conns:
+                print("❌ No Odometry topics found.")
+                return
+
+            print("✅ Found Odometry topics:")
+            for conn in odom_conns:
+                print(f" - {conn.topic}")
+
+            rows = []
+            for conn, timestamp, rawdata in tqdm(reader.messages(connections=odom_conns)):
+                msg = reader.deserialize(rawdata, conn.msgtype)
+
+                # Extract timestamp in ROS2 nanoseconds
+                ts_str = str(timestamp)  # Keep as string for unique filenames if needed
+
+                # Extract position and orientation
+                pos = msg.pose.pose.position
+                ori = msg.pose.pose.orientation
+                row = {
+                    'timestamp': ts_str,
+                    'x': pos.x,
+                    'y': pos.y,
+                    'z': pos.z,
+                    'qx': ori.x,
+                    'qy': ori.y,
+                    'qz': ori.z,
+                    'qw': ori.w
+                }
+                rows.append(row)
+
+            # Write to CSV
+            with open(output_csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+
+            print(f"\n🎉 Done! Exported {len(rows)} odometry messages to {output_csv_path}")
 
 class ros1bag():
     def __init__(self):
@@ -203,7 +256,8 @@ class ros1bag():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ROS Export")
-    parser.add_argument("--file", help="Location of the ROS bag", type=str)
+    parser.add_argument("-f", "--file", help="Location of the ROS bag", type=str)
+    parser.add_argument("-o", "--outdir", help="Location to save the outputs", type=str)
     args = parser.parse_args()
     path = args.file
 
@@ -226,11 +280,43 @@ if __name__ == "__main__":
     # get tops
     bag = ros2bag(path)
     tops = bag.get_topics()
-    print(tops)
+    print("Following topics found in bag :\n", tabulate(tops))
 
-    # Export data
-    print("Exporting point clouds")
-    bag.export_lidar_from_ros2bag(output_dir='/home/aakash-remote/Desktop/bag-export')
-    #os.system("source /opt/ros/rolling/setup.bash && ros2 bag info /xnet/aakash_rosbags/rosbag2_2025_06_17-11_00_56/ --topic-name")
+    _msg = """
+    What to export? (type corresponding number)
+    1. all
+    2. odometry
+    3. lidar\n
+    """
+    export_what = int(input(_msg))
+    
+    if export_what == 1:
+        print("Functionality currently unavailable")
+    elif export_what == 2:
+        # Export data
+        print("Exporting odometry")
+
+        _odo_path = os.path.join(args.outdir, "odometry.csv")
+        if os.path.isfile(_odo_path):
+            #os.mkdir(_lidar_path)
+            print("Odometry file already exists : ", _odo_path)
+            _overwrite = (input("Over-write ? (y / n)").lower() == "y")
+            if not _overwrite:
+                exit()
+
+        bag.export_odometry_from_ros2bag(output_csv_path=_odo_path) # '/home/aakash-remote/Desktop/bag-export'
+    elif export_what == 3:
+        # Export data
+        print("Exporting point clouds")
+
+        _lidar_path = os.path.join(args.outdir, "lidar")
+        if not os.path.isdir(_lidar_path):
+            os.mkdir(_lidar_path)
+            print("New directory made : ", _lidar_path)
+        bag.export_lidar_from_ros2bag(output_dir=_lidar_path) # '/home/aakash-remote/Desktop/bag-export'
+    else:
+        print("Unknown option chosen : ", export_what)
+    
+    
 
 

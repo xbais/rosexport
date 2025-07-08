@@ -62,6 +62,14 @@ def check_ros2_bag(bag_file_path):
     finally:
         conn.close()
 
+import os
+import csv
+import numpy as np
+from pathlib import Path
+import open3d as o3d
+from scipy.spatial.transform import Rotation as R
+from bisect import bisect_left
+
 class ros2bag():
     def __init__(self, path):
         self.path = path # Folder path that contains the bag
@@ -249,6 +257,101 @@ class ros2bag():
                 writer.writerows(rows)
 
             print(f"\n🎉 Done! Exported {len(rows)} odometry messages to {output_csv_path}")
+    
+    def load_odometry_csv(self,csv_path):
+        timestamps = []
+        odom_data = {}
+        with open(csv_path, newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                timestamp = int(row['timestamp'])  # assuming nanoseconds or consistent integer format
+                pose = {
+                    'position': np.array([float(row['x']), float(row['y']), float(row['z'])]),
+                    'orientation': np.array([float(row['qx']), float(row['qy']), float(row['qz']), float(row['qw'])])
+                }
+                timestamps.append(timestamp)
+                odom_data[timestamp] = pose
+        timestamps.sort()
+        return timestamps, odom_data
+
+
+    def find_nearest_timestamp(self, target_ts, sorted_ts_list):
+        idx = bisect_left(sorted_ts_list, target_ts)
+        if idx == 0:
+            return sorted_ts_list[0]
+        if idx == len(sorted_ts_list):
+            return sorted_ts_list[-1]
+        before = sorted_ts_list[idx - 1]
+        after = sorted_ts_list[idx]
+        return before if abs(target_ts - before) < abs(target_ts - after) else after
+
+
+    def transform_point_cloud(self, pcd, position, orientation):
+        R_mat = R.from_quat(orientation).as_matrix()
+        T = np.eye(4)
+        T[:3, :3] = R_mat
+        T[:3, 3] = position
+        return pcd.transform(T)
+
+
+    def combine_lidar_scans_with_nearest_odometry(
+        self,
+        odom_csv_path,
+        lidar_folder,
+        output_path,
+        lidar_topic='lidar_front',
+        verbose=True
+    ):
+        timestamps, odom_data = self.load_odometry_csv(odom_csv_path)
+        lidar_folder = Path(lidar_folder)
+        merged_pcd = o3d.geometry.PointCloud()
+
+        lidar_files = sorted(lidar_folder.glob(f"{lidar_topic}_*.pcd"))[:90]
+        print(f"Total lidar clouds to merge = {len(lidar_files)}")
+        percentage_to_merge = int(input("Percentage of files to merge (0 - 100) : "))
+
+        if not lidar_files:
+            print(f"❌ No LiDAR scans found for topic '{lidar_topic}' in {lidar_folder}")
+            return
+        print(f"Step = {int(len(lidar_files) * (percentage_to_merge/100))}")
+
+        for pcd_file_idx in tqdm(range(0,len(lidar_files),int(len(lidar_files) / (len(lidar_files)*(percentage_to_merge/100)))), desc="Merging clouds"):
+            pcd_file = lidar_files[pcd_file_idx]
+            try:
+                ts_str = pcd_file.stem.split('_')[-1]
+                lidar_ts = int(ts_str)
+            except Exception:
+                if verbose:
+                    print(f"⚠️ Skipping invalid filename: {pcd_file.name}")
+                continue
+
+            nearest_odom_ts = self.find_nearest_timestamp(lidar_ts, timestamps)
+            pose = odom_data.get(nearest_odom_ts, None)
+            if pose is None:
+                if verbose:
+                    print(f"⚠️ No odometry for timestamp: {nearest_odom_ts}")
+                continue
+
+            pcd = o3d.io.read_point_cloud(str(pcd_file))
+            if len(pcd.points) == 0:
+                if verbose:
+                    print(f"⚠️ Empty point cloud: {pcd_file.name}")
+                continue
+
+            transformed = self.transform_point_cloud(pcd, pose['position'], pose['orientation'])
+            merged_pcd += transformed
+
+            if verbose:
+                tqdm.write(f"✅ Merged {pcd_file.name} using odometry {nearest_odom_ts}")
+
+        if len(merged_pcd.points) == 0:
+            print("❌ No valid point clouds merged.")
+            return
+
+        o3d.io.write_point_cloud(str(output_path), merged_pcd)
+        
+        print(f"\n🎉 Combined LiDAR scan saved to: {output_path}")
+        o3d.visualization.draw_geometries([merged_pcd])
 
 class ros1bag():
     def __init__(self):
@@ -256,10 +359,10 @@ class ros1bag():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ROS Export")
-    parser.add_argument("-f", "--file", help="Location of the ROS bag", type=str)
+    parser.add_argument("-f", "--folder", help="Location of the ROS bag export folder", type=str)
     parser.add_argument("-o", "--outdir", help="Location to save the outputs", type=str)
     args = parser.parse_args()
-    path = args.file
+    path = args.folder
 
     # Detect the ROS version
     _ = os.listdir(path)
@@ -269,6 +372,7 @@ if __name__ == "__main__":
 
     print(f"ROS bag version = {version}")
     
+    '''
     # Setup ROS env, get the channel list
     if version == "ROS 2":
         # install ros2
@@ -276,7 +380,8 @@ if __name__ == "__main__":
     elif version  == "ROS 1":
         # install rosbag
         pass
-
+    '''
+    
     # get tops
     bag = ros2bag(path)
     tops = bag.get_topics()
@@ -316,6 +421,23 @@ if __name__ == "__main__":
         bag.export_lidar_from_ros2bag(output_dir=_lidar_path) # '/home/aakash-remote/Desktop/bag-export'
     else:
         print("Unknown option chosen : ", export_what)
+
+    combine_lidar_true = (input("Combine lidar with odometry? ( y / n )").lower() == "y")
+
+    if combine_lidar_true:
+        _ = ['_'.join(__.split('_')[:-2]) for __ in os.listdir(os.path.join(args.outdir, 'lidar'))]
+        #print(_)
+        probable_lidar_topics = sorted(list(set(_)))
+        
+        print("Probable lidar topics : \n", tabulate(enumerate(probable_lidar_topics)))
+        selected_topic = probable_lidar_topics[int(input("Type the index of the topic from above : "))]
+
+        bag.combine_lidar_scans_with_nearest_odometry(
+            output_path=os.path.join(args.outdir, 'combined_cloud.ply'), 
+            lidar_topic=selected_topic, 
+            odom_csv_path=os.path.join(args.outdir, 'odometry.csv'),
+            lidar_folder=os.path.join(args.outdir, 'lidar')
+            )
     
     
 

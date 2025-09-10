@@ -1,3 +1,7 @@
+# sudo apt-get install ros-rolling-tf-transformations
+# pip install transforms3d
+# Source ROS before running this script : source /opt/ros/rolling/setup.bash
+
 from pathlib import Path
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import get_types_from_msg, register_types
@@ -10,6 +14,26 @@ import sqlite3
 import csv 
 from tabulate import tabulate
 from tqdm import tqdm
+
+import numpy as np
+import open3d as o3d
+from pathlib import Path
+from rosbags.highlevel import AnyReader
+from rosbags.typesys import get_types_from_msg #, get_message
+#from geometry_msgs.msg import TransformStamped
+import tf_transformations
+import tf2_ros
+import tf2_py
+#from tf2_ros.buffer_interface import TransformException
+#from builtin_interfaces.msg import Time
+
+import os
+import csv
+import numpy as np
+from pathlib import Path
+import open3d as o3d
+from scipy.spatial.transform import Rotation as R
+from bisect import bisect_left
 
 def is_rosbag_ros1_or_ros2(bag_file_path):
     """
@@ -62,17 +86,13 @@ def check_ros2_bag(bag_file_path):
     finally:
         conn.close()
 
-import os
-import csv
-import numpy as np
-from pathlib import Path
-import open3d as o3d
-from scipy.spatial.transform import Rotation as R
-from bisect import bisect_left
+
 
 class ros2bag():
     def __init__(self, path):
         self.path = path # Folder path that contains the bag
+        self.file_path = os.path.join(path,[_ for _ in os.listdir(path) if _.endswith('.mcap')][0])
+
         # Register PointCloud2 message type
         msg_txt = """
         std_msgs/Header header
@@ -103,6 +123,7 @@ class ros2bag():
             for conn in reader.connections:
                 topics.append((conn.topic, conn.msgtype))
         return topics
+    
     
     '''
     def export_lidar(self, output_dir):
@@ -301,7 +322,7 @@ class ros2bag():
         output_path,
         lidar_topic='lidar_front',
         verbose=True
-    ):
+        ):
         timestamps, odom_data = self.load_odometry_csv(odom_csv_path)
         lidar_folder = Path(lidar_folder)
         merged_pcd = o3d.geometry.PointCloud()
@@ -353,6 +374,156 @@ class ros2bag():
         print(f"\n🎉 Combined LiDAR scan saved to: {output_path}")
         o3d.visualization.draw_geometries([merged_pcd])
 
+    # --- save lidar transformed to 'world' frame
+
+    def get_tf(self, tf_topics:list=['/tf', '/tf_static']) -> None:
+        '''Lists all the available tf transforms'''
+        with AnyReader([Path(self.path)]) as reader:
+            #reader.open()
+            for topic in tf_topics:
+                tf_conns = [c for c in reader.connections if c.topic == topic]
+
+                frames = set()
+                for conn, timestamp, rawdata in reader.messages(connections=tf_conns):
+                    msg = reader.deserialize(rawdata, conn.msgtype)
+                    for transform in msg.transforms:
+                        parent = transform.header.frame_id
+                        child = transform.child_frame_id
+                        frames.add((parent, child))
+
+                print(f"⬤ TF {topic} Tree edges (parent → child):")
+                for parent, child in sorted(frames):
+                    print(f"{parent} → {child}")
+        return
+
+    def export_lidar_transformed(self, output_dir, world_frame='world'):
+        bag_path = Path(self.path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        with AnyReader([bag_path]) as reader:
+            # --- Parse only the specified LiDAR topic ---
+            pc2_conns = [
+                c for c in reader.connections
+                if c.msgtype == 'sensor_msgs/msg/PointCloud2' and c.topic == '/husky/ouster/points'
+            ]
+
+            if not pc2_conns:
+                print("❌ No PointCloud2 topics found.")
+                return
+
+            print("✅ Found PointCloud2 topic(s):")
+            for conn in pc2_conns:
+                print(f" - {conn.topic}")
+
+            # --- Load TF messages over time ---
+            tf_conns = [c for c in reader.connections if 'tf' in c.topic]
+            tf_messages = []
+
+            for conn, timestamp, rawdata in tqdm(reader.messages(connections=tf_conns), desc='Reading TF'):
+                msg = reader.deserialize(rawdata, conn.msgtype)
+                if hasattr(msg, 'transforms'):
+                    for transform in msg.transforms:
+                        tf_messages.append((transform, timestamp))
+
+            # --- Build a time-aware TF buffer ---
+            tf_buffer = {}
+            for transform, timestamp in tf_messages:
+                parent = transform.header.frame_id.strip('/')
+                child = transform.child_frame_id.strip('/')
+                tf_buffer.setdefault((parent, child), []).append((
+                    timestamp, transform.transform.translation, transform.transform.rotation
+                ))
+
+            def get_transform_matrix(trans, rot):
+                return tf_transformations.concatenate_matrices(
+                    tf_transformations.translation_matrix([trans.x, trans.y, trans.z]),
+                    tf_transformations.quaternion_matrix([rot.x, rot.y, rot.z, rot.w])
+                )
+
+            def invert_transform(matrix):
+                return np.linalg.inv(matrix)
+
+            def find_latest_transform(parent, child, stamp):
+                key = (parent, child)
+                if key not in tf_buffer:
+                    return None
+                # Find the latest transform before or at 'stamp'
+                candidates = [t for t in tf_buffer[key] if t[0] <= stamp]
+                if not candidates:
+                    return None
+                latest = max(candidates, key=lambda t: t[0])
+                return get_transform_matrix(latest[1], latest[2])
+
+            def compute_transform_chain(from_frame, to_frame, stamp, visited=None):
+                if visited is None:
+                    visited = set()
+
+                from_frame = from_frame.strip('/')
+                to_frame = to_frame.strip('/')
+
+                if from_frame == to_frame:
+                    return np.identity(4)
+
+                visited.add(from_frame)
+
+                for (parent, child), transforms in tf_buffer.items():
+                    # Try child → parent (forward)
+                    if child == from_frame and parent not in visited:
+                        tfm = find_latest_transform(parent, child, stamp)
+                        if tfm is None:
+                            continue
+                        rest = compute_transform_chain(parent, to_frame, stamp, visited)
+                        if rest is not None:
+                            return rest @ tfm
+
+                    # Try parent → child (inverse)
+                    if parent == from_frame and child not in visited:
+                        tfm = find_latest_transform(parent, child, stamp)
+                        if tfm is None:
+                            continue
+                        rest = compute_transform_chain(child, to_frame, stamp, visited)
+                        if rest is not None:
+                            return rest @ invert_transform(tfm)
+
+                return None
+
+            # --- Export each LiDAR frame to world ---
+            count = 0
+            for conn, timestamp, rawdata in tqdm(reader.messages(connections=pc2_conns), desc='Exporting'):
+                msg = reader.deserialize(rawdata, conn.msgtype)
+                points = self.read_xyz_points(msg)
+                if not points:
+                    continue
+
+                np_points = np.array(points, dtype=np.float32)
+                frame_id = msg.header.frame_id.strip('/')
+
+                # Find full transform chain at message timestamp
+                transform = compute_transform_chain(frame_id, world_frame, timestamp)
+                if transform is None:
+                    tqdm.write(f"⚠️ No transform to {world_frame} for time {timestamp}")
+                    continue
+
+                # Apply transformation
+                ones = np.ones((np_points.shape[0], 1))
+                homogenous_points = np.hstack((np_points, ones))
+                transformed_points = (transform @ homogenous_points.T).T[:, :3]
+
+                # Save to PCD
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(transformed_points)
+
+                topic_name = conn.topic.strip('/').replace('/', '_')
+                filename = output_dir / f"{topic_name}_{count:05d}_{str(timestamp)}.pcd"
+                o3d.io.write_point_cloud(str(filename), pcd)
+                print(f"💾 Saved: {filename} ({len(transformed_points)} points)")
+                count += 1
+
+            print(f"\n🎉 Done! Exported {count} LiDAR frames in world frame.")
+
+        
+
 class ros1bag():
     def __init__(self):
         pass
@@ -366,8 +537,9 @@ if __name__ == "__main__":
 
     # Detect the ROS version
     _ = os.listdir(path)
-    _ = [os.path.join(path, __) for __ in _ if __.endswith('db3') ]
-    bagpath = _[0]
+    _ = [os.path.join(path, __) for __ in _ if (__.endswith('db3') )]
+    
+    bagpath = _[0] if _ else path
     version = is_rosbag_ros1_or_ros2(bagpath)
 
     print(f"ROS bag version = {version}")
@@ -385,14 +557,19 @@ if __name__ == "__main__":
     # get tops
     bag = ros2bag(path)
     tops = bag.get_topics()
-    print("Following topics found in bag :\n", tabulate(tops))
+    print("\n\nThe following transforms were found in the Ros2 bag")
+    bag.get_tf()
+
+    print("\n\nFollowing topics found in bag :\n", tabulate(tops))
 
     _msg = """
     What to export? (type corresponding number)
     1. all
     2. odometry
-    3. lidar\n
+    3. lidar
+    4. lidar in world frame\n
     """
+
     export_what = int(input(_msg))
     
     if export_what == 1:
@@ -419,6 +596,14 @@ if __name__ == "__main__":
             os.mkdir(_lidar_path)
             print("New directory made : ", _lidar_path)
         bag.export_lidar_from_ros2bag(output_dir=_lidar_path) # '/home/aakash-remote/Desktop/bag-export'
+    elif export_what == 4:
+        print("Exporting lidar in world frame")
+        _lidar_path = os.path.join(args.outdir, "lidar_world_frame")
+        if not os.path.isdir(_lidar_path):
+            os.mkdir(_lidar_path)
+            print("New directory made : ", _lidar_path)
+        
+        bag.export_lidar_transformed(output_dir=_lidar_path) # '/home/aakash-remote/Desktop/bag-export'
     else:
         print("Unknown option chosen : ", export_what)
 
@@ -438,7 +623,3 @@ if __name__ == "__main__":
             odom_csv_path=os.path.join(args.outdir, 'odometry.csv'),
             lidar_folder=os.path.join(args.outdir, 'lidar')
             )
-    
-    
-
-

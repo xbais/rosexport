@@ -86,8 +86,6 @@ def check_ros2_bag(bag_file_path):
     finally:
         conn.close()
 
-
-
 class ros2bag():
     def __init__(self, path):
         self.path = path # Folder path that contains the bag
@@ -306,14 +304,12 @@ class ros2bag():
         after = sorted_ts_list[idx]
         return before if abs(target_ts - before) < abs(target_ts - after) else after
 
-
     def transform_point_cloud(self, pcd, position, orientation):
         R_mat = R.from_quat(orientation).as_matrix()
         T = np.eye(4)
         T[:3, :3] = R_mat
         T[:3, 3] = position
         return pcd.transform(T)
-
 
     def combine_lidar_scans_with_nearest_odometry(
         self,

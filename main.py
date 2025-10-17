@@ -227,6 +227,99 @@ class ros2bag():
 
         print(f"\n🎉 Done! Exported {count} LiDAR frames.")
     
+    def export_rgb_from_ros2bag(self, output_dir):
+        from cv_bridge import CvBridge
+        import cv2
+
+        bag_path = Path(self.path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        bridge = CvBridge()
+
+        with AnyReader([bag_path]) as reader:
+            rgb_conns = [
+                c for c in reader.connections
+                if c.msgtype == 'sensor_msgs/msg/Image' and 'color' in c.topic
+            ]
+
+            if not rgb_conns:
+                print("❌ No RGB image topics found.")
+                return
+
+            print("✅ Found RGB image topics:")
+            for conn in rgb_conns:
+                print(f" - {conn.topic}")
+
+            count = 0
+            for conn, timestamp, rawdata in reader.messages(connections=rgb_conns):
+                msg = reader.deserialize(rawdata, conn.msgtype)
+
+                try:
+                    cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                except Exception as e:
+                    print(f"⚠️ Skipping frame due to error: {e}")
+                    continue
+
+                topic_name = conn.topic.strip('/').replace('/', '_')
+                filename = output_dir / f"{topic_name}_{count:05d}_{str(timestamp)}.png"
+                cv2.imwrite(str(filename), cv_img)
+                print(f"💾 Saved: {filename} ({cv_img.shape[1]}x{cv_img.shape[0]})")
+                count += 1
+
+        print(f"\n🎉 Done! Exported {count} RGB frames.")
+
+    def export_depth_from_ros2bag(self, output_dir):
+        from cv_bridge import CvBridge
+        import cv2
+
+        bag_path = Path(self.path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        bridge = CvBridge()
+
+        with AnyReader([bag_path]) as reader:
+            depth_conns = [
+                c for c in reader.connections
+                if c.msgtype == 'sensor_msgs/msg/Image' and 'depth' in c.topic
+            ]
+
+            if not depth_conns:
+                print("❌ No depth image topics found.")
+                return
+
+            print("✅ Found depth image topics:")
+            for conn in depth_conns:
+                print(f" - {conn.topic}")
+
+            count = 0
+            for conn, timestamp, rawdata in reader.messages(connections=depth_conns):
+                msg = reader.deserialize(rawdata, conn.msgtype)
+
+                try:
+                    # Depth images are typically 16UC1 or 32FC1
+                    cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+                except Exception as e:
+                    print(f"⚠️ Skipping frame due to error: {e}")
+                    continue
+
+                topic_name = conn.topic.strip('/').replace('/', '_')
+                filename = output_dir / f"{topic_name}_{count:05d}_{str(timestamp)}.png"
+
+                # Normalize and save as 16-bit PNG if needed
+                if cv_img.dtype == np.float32:
+                    cv_img = (cv_img * 1000).astype(np.uint16)  # Convert meters to mm
+                elif cv_img.dtype != np.uint16:
+                    print(f"⚠️ Unexpected depth image dtype: {cv_img.dtype}, skipping.")
+                    continue
+
+                cv2.imwrite(str(filename), cv_img)
+                print(f"💾 Saved: {filename} ({cv_img.shape[1]}x{cv_img.shape[0]})")
+                count += 1
+
+        print(f"\n🎉 Done! Exported {count} depth frames.")
+
     def export_odometry_from_ros2bag(self, output_csv_path):
         bag_path = Path(self.path)
         output_csv_path = Path(output_csv_path)
@@ -563,7 +656,10 @@ if __name__ == "__main__":
     1. all
     2. odometry
     3. lidar
-    4. lidar in world frame\n
+    4. lidar in world frame
+    5. rgb images
+    6. depth images
+    \n
     """
 
     export_what = int(input(_msg))
@@ -600,6 +696,22 @@ if __name__ == "__main__":
             print("New directory made : ", _lidar_path)
         
         bag.export_lidar_transformed(output_dir=_lidar_path) # '/home/aakash-remote/Desktop/bag-export'
+    elif export_what == 5:
+        # export rgb images
+        print('Exporting RGB images')
+        _path = os.path.join(args.outdir, "rgb_images")
+        if not os.path.isdir(_path):
+            os.mkdir(_path)
+            print("New directory made : ", _path)
+        bag.export_rgb_from_ros2bag(output_dir=_path)
+    elif export_what == 6:
+        # export rgb images
+        print('Exporting RGB images')
+        _path = os.path.join(args.outdir, "depth_images")
+        if not os.path.isdir(_path):
+            os.mkdir(_path)
+            print("New directory made : ", _path)
+        bag.export_depth_from_ros2bag(output_dir=_path)
     else:
         print("Unknown option chosen : ", export_what)
 
